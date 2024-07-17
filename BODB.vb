@@ -3,7 +3,9 @@ Imports System.Text.RegularExpressions
 Imports System.Linq
 
 Public Module BODB
-    Public Function DBSQLite(ByVal PString) As (status As String, cargo As String)
+
+    Public Function DBSQLite(ByVal PString As String) As (status As String, cargo As String)
+
         'PString: fileName '|' table '|' field '|' value 
 
         'Check for vertical bar char
@@ -12,63 +14,142 @@ Public Module BODB
             Return ("BOBD-E-NO_VERTICAL_BAR_CHARS", PString)
         End If
 
-        'Split on vertical bar chars
+        'split and fill to 4 slots
         Dim parts = Split(PString, "|", -1, CompareMethod.Text).ToList()
+        Do While parts.Count < 4
+            parts.Add(vbNullString)
+        Loop
 
-        Dim partsCount = parts.Count
-        'check all fields present (4 in total)
-        If parts.Count = 0 Then
-            Return ("BODB-E-NOT_ENOUGH_FIELDS_PRESENT", PString)
-        End If
-
-        'get and check filename
-        Dim idx As Integer = 0
-        Dim fileName As String = parts(idx)
+        Dim fileName As String = parts(0)
+        'check filename
         If fileName = vbNullString Then
             Return ("BOBD-E-EMPTY_FILENAME", "")
         End If
         If Not IO.File.Exists(fileName) Then
-            Return ("BOBD-E-FILENAME_NOT_FOUND", fileName)
+            Return ("BOBD-E-FILE_NOT_FOUND", fileName)
         End If
 
+        'check if file can be read
+        Dim handle As IO.FileStream
+        Try
+            handle = IO.File.Open(fileName, IO.FileMode.Open, IO.FileAccess.Read, IO.FileShare.ReadWrite)
+        Catch ex As Exception
+            Return ("BOBD-E-FILE_CANNOT_BE_READ", ex.Message)
+        End Try
+
+        'If Not handle.CanRead() Then
+        'Return ("BOBD-E-FILE_CANNOT_BE_READ", fileName)
+        'End If
+
+        'check if fileName is a SQLite database
+        Dim reader = New System.IO.BinaryReader(handle)
+        Dim First16 = reader.ReadBytes(16)
+        If System.Text.Encoding.ASCII.GetString(First16) <> ("SQLite format 3" & vbNullChar) Then
+            Return ("BOBD-E-FILE_NOT_SQLITE", fileName)
+        End If
+        reader.Close()
+        handle.Close()
+
         'connect to sqlite file
-        Dim conn As New SQLiteConnection()
+        Dim connection As New SQLiteConnection()
 
         'fileName might be a connection string
         Dim connectionString As String = ReworkConnectionString(fileName)
-        'conn.ConnectionString = connectionString
-        'conn.Open()
 
-        'get and check tablename
-        idx = 1
-        Dim tableName As String = parts(idx)
+        Dim tableName As String = parts(1)
+        Dim listOfTables = GetListOfTables(connectionString)
         If tableName = vbNullString Then
-            Return ("BODB-E-EMPTY_TABLENAME", PString)
+            Return ("", String.Join("^", listOfTables))
         End If
 
-        Dim tableList = GetListOfTables(connectionString)
-
-        If tableList.IndexOf(tableName) = -1 Then
+        If listOfTables.IndexOf(tableName) = -1 Then
             Return ("BODB-E-TABLENAME_NOT_FOUND", PString)
         End If
 
-        'get and check fieldname
-        Dim fieldName As String = parts(2)
+        Dim listOfFields = GetAllFieldNamesInTable(connectionString, tableName)
+        Dim fieldName = parts(2)
+        If fieldName = vbNullString Then
+            Return ("", Join(listOfFields.ToArray(), "^"))
+        End If
 
-        'get and check comparison value
-        Dim comparisonValue As String = parts(3)
+        If listOfFields.IndexOf(fieldName) = -1 Then
+            Return ("BODB-E-FIELD_NOT_FOUND", PString)
+        End If
 
+        Dim value = parts(3)
+        If value = vbNullString Then
+            Return ("", GetAllValuesOfFieldInTable(connectionString, tableName, fieldName))
+        End If
+
+        Return ("", GetAllRecordsWhereFieldEqualsValue(connectionString, tableName, fieldName, value))
+    End Function
+
+    Private Function GetAllRecordsWhereFieldEqualsValue(connectionString As String, tableName As String, fieldName As String, value As String) As String
+        Dim result As New List(Of String)
+        Dim reader As SQLiteDataReader = SQLiteCommand.Execute($"SELECT * FROM {tableName} WHERE {fieldName} = '{value}';", SQLiteExecuteType.Reader, connectionString)
+
+        Do While reader.Read()
+            Dim values = reader.GetValues()
+            Dim keys As String() = values.AllKeys
+            result.Add(Join((From key In keys
+                             Let valuePart = values(key)
+                             Select $"{key}^{valuePart}").ToArray(), "~"))
+        Loop
+        Return Join(result.ToArray(), "`")
+    End Function
+
+    Private Function GetAllValuesOfFieldInTable(connectionString As String, tableName As String, fieldName As String) As String
+        Dim result As New List(Of String)
+        Dim reader As SQLiteDataReader = SQLiteCommand.Execute($"SELECT {fieldName} FROM {tableName};", SQLiteExecuteType.Reader, connectionString)
+
+        Do While reader.Read()
+            Dim values = reader.GetValues()
+            Dim keys As String() = values.AllKeys
+            result.Add(Join((From key In keys
+                             Let valuePart = values(key)
+                             Select $"{key}^{valuePart}").ToArray(), "~"))
+        Loop
+        reader.Close()
+        Return Join(result.ToArray(), "`")
+    End Function
+
+    Private Function GetAllFieldNamesInTable(connectionString As String, tableName As String) As List(Of String)
+        Dim names As New List(Of String)
+        Dim reader As SQLiteDataReader = SQLiteCommand.Execute($"PRAGMA table_info({tableName});", SQLiteExecuteType.Reader, connectionString)
+        Do While reader.Read()
+            Dim values = reader.GetValues()
+            names.Add(values("name"))
+        Loop
+        reader.Close()
+        Return names
+    End Function
+
+    Private Function GetAllRecordsInTable(connectionString As String, tableName As String) As String
+        Dim result As New List(Of String)
+        Dim reader As SQLiteDataReader = SQLiteCommand.Execute($"SELECT * FROM {tableName};", SQLiteExecuteType.Reader, connectionString)
+
+        Do While reader.Read()
+            Dim values = reader.GetValues()
+            Dim keys As String() = values.AllKeys
+            result.Add(Join((From key In keys
+                             Let valuePart = values(key)
+                             Select $"{key}^{valuePart}").ToArray(), "~"))
+        Loop
+        reader.Close()
+        Return Join(result.ToArray(), "`")
     End Function
 
     Private Function GetListOfTables(connectionString As String) As List(Of String)
         Dim tables As New List(Of String)
-        Dim reader = SQLiteCommand.Execute("PRAGMA table_list;", SQLiteExecuteType.Reader, connectionString)
+        Dim reader As SQLiteDataReader = SQLiteCommand.Execute("PRAGMA table_list;", SQLiteExecuteType.Reader, connectionString)
 
-        Do
+        Do While reader.Read()
             Dim values = reader.GetValues()
-            tables.Add(values("name"))
-        Loop Until Not reader.Read()
-
+            If Not values("name").StartsWith("sqlite_") Then
+                tables.Add(values("name"))
+            End If
+        Loop
+        reader.Close()
         Return tables
     End Function
 
